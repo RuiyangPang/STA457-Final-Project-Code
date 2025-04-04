@@ -1,0 +1,220 @@
+---
+title: "STA457 Final Project GARCH code"
+output: pdf_document
+---
+
+```{r}
+
+library(tidyverse)
+library(lubridate)
+library(forecast)
+library(tseries)
+library(fGarch)
+library(FinTS)
+library(rugarch)
+
+cocoa_data <- read.csv("Daily Prices_ICCO.csv", stringsAsFactors = FALSE)
+cocoa_data$Date <- as.Date(cocoa_data$Date, format='%d/%m/%Y')
+cocoa_data$Price <- as.numeric(gsub(",", "", cocoa_data$ICCO.daily.price..US..tonne.))
+cocoa_data <- cocoa_data %>% select(Date, Price) %>% arrange(Date)
+
+start_year <- as.numeric(format(cocoa_data$Date[1], "%Y"))
+start_day  <- as.numeric(format(cocoa_data$Date[1], "%j"))
+
+price_ts <- ts(
+  data      = cocoa_data$Price,
+  start     = c(start_year, start_day),
+  frequency = 365
+)
+
+#split dataset
+train_ts <- price_ts[1:(length(price_ts) - 5)]
+test_ts <- price_ts[(length(price_ts) - 4):length(price_ts)]
+
+ts.plot(price_ts, main="Cocoa Price") #Data analysis and summary statistics are done in seperate code files
+```
+
+```{r}
+#process the training data to fit model
+ts.plot(train_ts, main="Training data")
+adf.test(train_ts) #p-value greater than 0.05, non stationary, need first order differencing
+```
+```{r}
+#difference the training data
+train_ts_diff <- diff(train_ts)
+ts.plot(train_ts_diff, main="First-Differenced Training data")
+adf.test(train_ts_diff) #p-value less than 0.05, first order differencing is sufficient to make the train data stationary.
+```
+
+```{r}
+acf(train_ts_diff) # ACF cutoff after lag 4
+pacf(train_ts_diff) # PACF cutoff after lag 5
+```
+
+```{r}
+#Fit ARIMA model for training data based on ACF/PACF/ADF results
+model_AR = arima(train_ts, c(4, 1, 0))
+model_MA = arima(train_ts, c(0, 1, 5))
+model_ARIMA = auto.arima(train_ts)
+summary(model_AR)
+summary(model_MA)
+summary(model_ARIMA)
+AIC(model_AR)
+AIC(model_MA)
+AIC(model_ARIMA) #auto.arima suggest ARIMA (5,1,1) model.
+# ARIMA and SARIMA models are constructed and analyzed in seperate code files. Here, we determine that ARIMA and SARIMA models are insufficient in modeling our time series data since ARCH effect is present. We can see large volitility and surge from data, indicating the variance is not constant over time.
+```
+
+```{r}
+#use log transformation to process the training data for fitting GARCH model
+pricegr = diff(log(train_ts))
+pricegr <- na.omit(pricegr)
+```
+
+```{r}
+# run ARMA model first for log transformed training data to determine ARMA component order
+modelARMA = auto.arima(pricegr)
+summary(modelARMA) #suggests ar(4,0) model, check RMSE, AIC
+```
+```{r}
+#test if ARCH component is necessary in the model
+ArchTest(pricegr) # p value less than 0.05 indicates GARCH modelling is justified
+```
+
+```{r}
+# check acf and pacf plot for arma residuals, pacf like white noise indicating mean is well-specified, the arma component is good enough.
+arma_residuals <- modelARMA$residuals
+
+acf(arma_residuals)
+pacf(arma_residuals)
+```
+
+```{r}
+#inspect the need and order of GARCH model by looking at the variance acf and pacf plots.
+arma_residuals_squared <- modelARMA$residuals^2
+
+acf(arma_residuals_squared)
+pacf(arma_residuals_squared)
+# acf and pacf plots for squared residuals see autocorrelation, spikes at early lags. ARCH effect is present, GARCH model is justified.
+```
+
+
+```{r}
+#Using UGARCHFIT to fit GARCH model:
+uspec <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
+  mean.model = list(armaOrder = c(4,0), include.mean = TRUE),
+  distribution.model = "std"
+)
+
+ugarchmodel <- ugarchfit(spec = uspec, data = pricegr)
+show(ugarchmodel)
+summary(ugarchmodel)
+```
+```{r}
+#forecast growth:
+forecast <- ugarchforecast(ugarchmodel, n.ahead = 5)
+predicted_price_growth <- as.numeric(fitted(forecast))
+```
+
+```{r}
+#forecast price:
+base_price <- as.numeric(price_ts[7808])
+sumpricegr <- cumsum(predicted_price_growth)
+forecasted_price <- base_price * exp(sumpricegr)
+print(forecasted_price)
+```
+
+```{r}
+#compare it with actual price which is test data:
+true_price <- test_ts
+
+#plot the comparison:
+full_time_index <- 1 :length(price_ts) # include previous observations
+time_index <- (length(price_ts) - 4):length(price_ts)  # Last 5 time points for comparison
+
+# Plot all observations
+plot(full_time_index, price_ts, type = "l", col = "grey", lwd = 2,
+     ylim = range(c(price_ts, forecasted_price)),
+     ylab = "Price", xlab = "Time", main = "GARCH Forecast vs True Prices")
+
+# Highlight forecasted price versus true price
+lines(time_index, forecasted_price, col = "red", lwd = 2, lty = 2, type = "o", pch = 16)
+lines(time_index, true_price, col = "blue", lwd = 2, lty = 2, type = "o", pch = 16)
+
+# Add vertical line marking start of forecast
+abline(v = time_index[1], col = "black", lty = 2, lwd = 1.5)
+
+# Add legend
+legend("topleft", legend = c("Historical Data", "True Price", "Forecasted Price"),
+       col = c("gray", "blue", "red"), lwd = c(1, 2, 2), lty = c(1, 1, 2), pch = c(NA, 16, 16))
+
+#zoomed in view of comparison between forecast and true price based on 5 obs from test data
+last_5 <- (length(price_ts) - 4):length(price_ts)
+
+plot.ts(price_ts[last_5], col = "blue", lwd = 2, ylab = "Price",
+        main = "Comparison of True vs Forecasted (Last 5 Observations)")
+lines(forecasted_price, col = "red", lwd = 2, lty = 2)
+
+legend("bottomright", legend = c("True", "Forecasted"), col = c("blue", "red"), lty = c(1, 2), lwd = 2)
+```
+
+```{r}
+#scatterplots and residual plots:
+print(summary(true_price))
+print(summary(forecasted_price))
+
+plot(true_price, forecasted_price, xlab = "True Price", ylab = "Forecasted Price",
+     main = "Scatter Plot: Forecasted vs True Price",
+     )
+abline(0, 1, col = "red", lwd = 2, lty = 2)
+
+residuals <- true_price - forecasted_price
+
+plot(time_index, residuals,type = "o", pch = 16, col = "red",
+     xlab = "Time", ylab = "Residual",
+     main = "Residual Plot: Forecast Errors")
+abline(h = 0, col = "blue", lty = 2)
+```
+
+```{r}
+#test if GARCH and APARCH model improves the model by removing ARCH effect
+res_ugarch <- residuals(ugarchmodel, standardize = TRUE)
+ArchTest(res_ugarch^2)
+# the p value is now greater than 0.05, indicating the ARCH effect is removed, GARCH 1, 1 is sufficient in removing the ARCH effect.
+```
+```{r}
+#check the UGARCH model, validation process
+plot(res_ugarch) #check no pattern like white noise
+acf(res_ugarch) 
+pacf(res_ugarch) # white noise, good
+acf(res_ugarch^2)
+pacf(res_ugarch^2) # like white noise, good
+Box.test(res_ugarch) 
+Box.test(res_ugarch^2) 
+jarque.bera.test(res_ugarch) #p value smaller than 0.05, normality fails, reason is that the time series data of cocoa price is not normally distributed
+qqnorm(res_ugarch) # qq plot shows close to theoretical line, no tailing off or fat tails
+qqline(res_ugarch)
+```
+```{r}
+#generate AIC, BIC values for model comparison
+info <- infocriteria(ugarchmodel)
+print(info)
+#ACF of residuals like white noise, model is good
+plot(ugarchmodel, which = 10)
+```
+
+```{r}
+#MSE value for model comparison
+rmse <- sqrt(mean((test_ts - forecasted_price)^2))
+print(paste("RMSE: ", rmse))
+```
+
+
+
+
+
+
+
+
+
