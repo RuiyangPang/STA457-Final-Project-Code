@@ -1,0 +1,156 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+```{r, results=FALSE}
+library(readr)
+library(astsa)
+library(ggplot2)
+library(forecast)
+library(tidyverse)
+library(lubridate)
+library(dplyr)
+library(car)
+library(caret)
+```
+
+# ------------------------------------------
+## Fitted ARIMA model by merging two datasets
+# ------------------------------------------
+
+```{r}
+# Read and manipulate Cocoa Price Data
+
+cocoa <- read.csv("Daily Prices_ICCO.csv", stringsAsFactors = FALSE)
+
+cocoa$Date <- as.Date(cocoa$Date, format='%d/%m/%Y')
+cocoa <- cocoa %>% arrange(Date)   # Ensure data is sorted by Date.
+
+# Adjust the column names for convenience.
+colnames(cocoa)[1] <- "DATE"
+colnames(cocoa)[2] <- "DailyPrice"
+
+cocoa$DailyPrice <- gsub(",", "", cocoa$DailyPrice) # Remove any non-numeric characters in Price column.
+cocoa$DailyPrice <- as.numeric(cocoa$DailyPrice)    # Convert the results to numeric.
+
+# Aggregate cocoa_data if there are multiple prices per day
+cocoa_daily <- cocoa %>%
+  group_by(DATE) %>%
+  summarize(cocoa_price = mean(DailyPrice, na.rm = TRUE)) %>%
+  ungroup()
+```
+
+```{r}
+# Read and manipulate Weather and Precipitation Data
+
+climate_data <- read.csv("Ghana_data.csv", stringsAsFactors = FALSE) %>%
+  mutate(DATE = as.Date(DATE, format = "%Y-%m-%d")) %>%
+  arrange(DATE)
+
+climate_data$PRCP[climate_data$PRCP == ""] <- NA
+climate_data <- climate_data %>%
+  filter(!is.na(PRCP)) %>%
+  filter(!is.na(TAVG))
+
+climate_data$PRCP <- as.numeric(climate_data$PRCP)
+climate_data$TMAX <- as.numeric(climate_data$TMAX)
+climate_data$TMIN <- as.numeric(climate_data$TMIN)
+
+# Aggregate climate_data if there are multiple stations per day
+climate_daily <- climate_data %>%
+  group_by(DATE) %>%
+  summarize(
+    prcp = mean(PRCP, na.rm = TRUE),
+    tavg = mean(TAVG, na.rm = TRUE),
+    tmax = mean(TMAX, na.rm = TRUE),
+    tmin = mean(TMIN, na.rm = TRUE)
+  ) %>%
+  ungroup()
+```
+
+```{r}
+# Merge datasets
+merged_data <- inner_join(cocoa_daily, climate_daily, by = "DATE")
+
+# Split the dataset into training and testing datasets
+n <- nrow(merged_data)
+train_merged <- merged_data[1:(n - 5), ]
+test_merged <- merged_data[(n - 4) : n, ]
+```
+
+```{r}
+# Create time series objects
+price_ts <- ts(merged_data$cocoa_price, frequency = 365)
+
+# Calculate Variance Inflation Factor (VIF)
+vif(lm(cocoa_price ~ prcp + tavg, data = merged_data))
+```
+
+We obtain the VIF value for average temperature and perception lower than 5, which indicates no significant multicollinearity.
+
+```{r}
+plot(price_ts)
+acf2(price_ts)
+```
+
+The plot reveals non-stationarity with an upward trend and significant volatility, especially toward the end of the series, and the corresponding ACF plot indicates a slow decay of autocorrelations, confirming non-stationarity.
+
+```{r}
+ls = log(price_ts); dls = diff(ls)
+plot.ts(cbind(price_ts,ls,dls), main="")
+```
+
+The log transformation is applied for variance-stabilizing, and we difference the log-transformed series to remove the trend.
+
+```{r}
+acf2(ls)
+acf2(dls)
+```
+
+```{r}
+# Fit Non-Seasonal ARIMA to the training data
+train_ts <- ts(train_merged$cocoa_price, frequency = 365)
+
+train_merged$Month <- factor(month(train_merged$DATE),levels = 1:12, labels = month.abb)
+climate_reg <- model.matrix(~ Month - 1, data = train_merged)
+climate_reg <- climate_reg[, -1]
+
+arima_model_reg <- auto.arima(train_ts, seasonal = TRUE, xreg = climate_reg)
+summary(arima_model_reg)
+```
+
+```{r}
+sarima(train_ts, 4, 1, 1)
+```
+
+
+```{r}
+#Further Predictions and Comparison with Test Data
+test_merged$Month <- factor(month(test_merged$DATE), levels = 1:12, labels = month.abb)
+forecast_reg <- model.matrix(~ Month - 1, data = test_merged)[, -1]
+forecast_arima_reg <- forecast(arima_model_reg, h = 5, xreg = forecast_reg)
+forecast_arima_reg
+forecast_arima <- forecast(arima_111, h = 5)
+forecast_arima
+
+test_ts <- ts(test_merged$cocoa_price, frequency = 365)
+test_ts
+
+forecast_df <- data.frame(
+  Date = test_merged$DATE,
+  Actual = test_merged$cocoa_price,
+  ARIMA_Reg_Forecast = forecast_arima_reg$mean,
+  ARIMA_Forecast = forecast_arima$mean)
+
+# Plot actual vs predicted values
+ggplot(forecast_df, aes(x = Date)) +
+  geom_line(aes(y = Actual, color = "Actual Price"), linewidth = 1) +
+  geom_line(aes(y = ARIMA_Reg_Forecast, color = "ARIMA Reg Forecast"), linetype = "dotted", linewidth = 1) +
+  geom_line(aes(y = ARIMA_Forecast, color = "ARIMA Forecast"), linetype = "dotted", linewidth = 1) +
+  labs(title = "Model Prediction vs. Actual Cocoa Prices (Test Data)",
+       x = "Date",
+       y = "Cocoa Price",
+       color = "Legend") +
+  theme_minimal()
+```
